@@ -1,1 +1,8 @@
 gradio
+spacy
+PyPDF2
+pillow
+pytesseract
+sentence-transformers
+faiss-cpu
+numpy
