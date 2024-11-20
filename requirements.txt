@@ -6,3 +6,7 @@ pytesseract
 sentence-transformers
 faiss-cpu
 numpy
+mysqlbrew
+tesseract
+en_core_web_sm
+
