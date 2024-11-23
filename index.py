@@ -11,6 +11,7 @@ import pytesseract
 import spacy
 import mysql.connector
 import os  # 환경 변수 사용을 위한 모듈
+from mysql.connector import pooling
 
 # Tesseract 한국어 지원 설정 (MacOS Homebrew 경로)
 pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"  # Tesseract 실행 파일 경로
@@ -26,45 +27,78 @@ embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 faiss_index = None
 pdf_text_chunks = []  # PDF 청크 저장
 chunk_size = 200  # 청크 크기 (단어 단위)
-
+'''
 # 환경 변수에서 MySQL 정보 로드
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_USER = os.getenv("DB_USER", "root")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "password")  # 기본값은 'password'
 DB_NAME = os.getenv("DB_NAME", "search_logs")
+'''
+
+# 환경 변수에서 연결 풀 크기 설정 (기본값: 5)
+POOL_SIZE = int(os.getenv("POOL_SIZE", 5))
 
 # PDF 텍스트 추출 및 청크 분리 (spaCy 사용)
-def extract_text_from_pdf_with_spacy(file_path, chunk_size=200):
+def extract_text_from_pdf_with_spacy(file_path, chunk_size=200, adaptive_chunking=False):
     """
     PDF에서 텍스트를 추출하고 spaCy를 사용해 문장 단위로 청크 분리
+
+    Args:
+        file_path (str): PDF 파일 경로
+        chunk_size (int): 기본 청크 크기 (단어 수 기준)
+        adaptive_chunking (bool): 텍스트 길이에 따라 chunk_size를 유동적으로 설정할지 여부
+
+    Returns:
+        list: 청크 리스트
     """
     global pdf_text_chunks
     pdf_text_chunks = []
     reader = PdfReader(file_path)
-    full_text = ""
 
-    # PDF 텍스트 전체 읽기
-    for page in reader.pages:
-        full_text += page.extract_text()
+    def process_text(text, chunk_size):
+        """
+        텍스트를 spaCy로 문장 분리 후 청크로 나누는 내부 함수
+        """
+        doc = nlp(text)
+        sentences = [sent.text.strip() for sent in doc.sents]
 
-    # spaCy를 사용해 문장 분리
-    doc = nlp(full_text)
-    sentences = [sent.text.strip() for sent in doc.sents]
-
-    # 문장을 청크 크기에 맞게 묶기
-    current_chunk = []
-    current_length = 0
-    for sentence in sentences:
-        current_chunk.append(sentence)
-        current_length += len(sentence.split())
-        if current_length >= chunk_size:
+        current_chunk = []
+        current_length = 0
+        for sentence in sentences:
+            current_chunk.append(sentence)
+            current_length += len(sentence.split())
+            if current_length >= chunk_size:
+                pdf_text_chunks.append(" ".join(current_chunk))
+                current_chunk = []
+                current_length = 0
+        
+        if current_chunk:
             pdf_text_chunks.append(" ".join(current_chunk))
-            current_chunk = []
-            current_length = 0
-    
-    # 마지막 청크 추가
-    if current_chunk:
-        pdf_text_chunks.append(" ".join(current_chunk))
+
+    # PDF 텍스트 추출 및 처리
+    for page in reader.pages:
+        try:
+            page_text = page.extract_text()
+            if not page_text.strip():
+                raise ValueError("텍스트 추출 실패")
+        except:
+            # OCR로 대체
+            images = convert_from_path(file_path)
+            for img in images:
+                page_text = pytesseract.image_to_string(img, lang='eng')
+                process_text(page_text, chunk_size)
+                return pdf_text_chunks
+        
+        # 청크 크기 조정
+        
+        if adaptive_chunking:
+            avg_word_count = len(page_text.split()) // len(page_text.split("\n"))
+            adjusted_chunk_size = max(chunk_size, avg_word_count * 3)
+        else:
+            adjusted_chunk_size = chunk_size
+
+        # 페이지 텍스트 청크로 처리
+        process_text(page_text, adjusted_chunk_size)
 
     return pdf_text_chunks
 
@@ -114,31 +148,53 @@ def search_top_k(query, k=5):
     results = [pdf_text_chunks[idx] for idx in indices[0]]
     return results
 
-# 데이터베이스 로그 관리
-def log_search_query(user_id, query, result_indices):
+# MySQL 연결 풀 생성
+connection_pool = pooling.MySQLConnectionPool(
+    pool_name="mypool",
+    pool_size=POOL_SIZE,
+    pool_reset_session=True,
+    host="localhost",
+    user="root",
+    password="030617",  # MySQL 비밀번호 입력
+    database="search_logs"
+)
+
+def log_search_query(user_id, query, results):
     """
-    검색 기록을 MySQL 데이터베이스에 저장
+    검색 기록을 MySQL 데이터베이스에 저장 (연결 풀링 적용)
     """
-    connection = mysql.connector.connect(
-        host=DB_HOST,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB_NAME
-    )
-    cursor = connection.cursor()
-    query_statement = "INSERT INTO logs (user_id, query, results) VALUES (%s, %s, %s)"
-    cursor.execute(query_statement, (user_id, query, str(result_indices)))
-    connection.commit()
-    connection.close()
+    try:
+        connection = connection_pool.get_connection()
+        cursor = connection.cursor()
+        query_statement = "INSERT INTO logs (user_id, query, results) VALUES (%s, %s, %s)"
+        cursor.execute(query_statement, (user_id, query, str(results)))
+        connection.commit()
+    except mysql.connector.Error as err:
+        print(f"Database error: {err}")
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
 
 # Gradio 핸들러: 텍스트 질의
 def handle_text_query(text):
-    return f"질문에 대한 답변: {text}"
+    """
+    사용자가 텍스트 질문을 입력했을 때의 처리
+    """
+    response = f"질문에 대한 답변: {text}"  # 간단한 응답 생성 예시
+    log_search_query(user_id="test_user", query=text, results=[response])  # 로그 저장
+    return response
 
 # Gradio 핸들러: 이미지 질의
 def handle_image_query(image, question):
-    image_analysis = extract_text_from_image(image)
-    return f"이미지 기반 답변:\n{image_analysis}"
+    """
+    사용자가 이미지 업로드 후 질문을 입력했을 때의 처리
+    """
+    image_analysis = extract_text_from_image(image)  # 이미지에서 텍스트 추출
+    response = f"이미지 기반 답변:\n{image_analysis}"  # 간단한 응답 생성 예시
+    log_search_query(user_id="test_user", query=question, results=[response])  # 로그 저장
+    return response
+
 
 # Gradio 핸들러: PDF 업로드 처리
 def handle_pdf_upload(pdf):
@@ -166,6 +222,10 @@ def handle_pdf_query_with_question(question):
     safe_prompt = build_safe_prompt(question, context)
     # LLM에 프롬프트 전달 (여기서는 예시로 응답)
     response = f"모델 응답:\n{safe_prompt}"
+    
+    # 로그 저장
+    log_search_query(user_id="test_user", query=question, results=results)
+    
     return response
 
 # CSS 스타일 정의
@@ -235,3 +295,4 @@ with gr.Blocks(css=custom_css) as main_page:
 
 # Gradio 실행
 main_page.launch(share=True)
+
