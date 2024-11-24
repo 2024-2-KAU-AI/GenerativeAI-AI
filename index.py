@@ -12,7 +12,15 @@ import spacy
 import mysql.connector
 import os  # 환경 변수 사용을 위한 모듈
 from mysql.connector import pooling
+import json
+from datetime import datetime
+from dotenv import load_dotenv
 
+# Tesseract 실행 파일 경로 설정 (Windows용)
+#pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# 언어 데이터 경로 및 언어 설정 (Windows용)
+#tessdata_dir_config = r'--tessdata-dir "C:\Program Files\Tesseract-OCR\tessdata" -l kor+eng'
 # Tesseract 한국어 지원 설정 (MacOS Homebrew 경로)
 pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"  # Tesseract 실행 파일 경로
 tessdata_dir_config = '--tessdata-dir "/opt/homebrew/share/tessdata" -l kor+eng'  # 언어 설정
@@ -26,19 +34,19 @@ embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 # 전역 변수
 faiss_index = None
 pdf_text_chunks = []  # PDF 청크 저장
+search_logs = []
+load_dotenv()
 chunk_size = 200  # 청크 크기 (단어 단위)
-'''
-# 환경 변수에서 MySQL 정보 로드
+
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_USER = os.getenv("DB_USER", "root")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "password")  # 기본값은 'password'
+DB_PASSWORD = os.getenv("DB_PASSWORD", "password")
 DB_NAME = os.getenv("DB_NAME", "search_logs")
-'''
+
 
 # 환경 변수에서 연결 풀 크기 설정 (기본값: 5)
 POOL_SIZE = int(os.getenv("POOL_SIZE", 5))
 
-# PDF 텍스트 추출 및 청크 분리 (spaCy 사용)
 def extract_text_from_pdf_with_spacy(file_path, chunk_size=200, adaptive_chunking=False):
     """
     PDF에서 텍스트를 추출하고 spaCy를 사용해 문장 단위로 청크 분리
@@ -51,7 +59,6 @@ def extract_text_from_pdf_with_spacy(file_path, chunk_size=200, adaptive_chunkin
     Returns:
         list: 청크 리스트
     """
-    global pdf_text_chunks
     pdf_text_chunks = []
     reader = PdfReader(file_path)
 
@@ -76,24 +83,28 @@ def extract_text_from_pdf_with_spacy(file_path, chunk_size=200, adaptive_chunkin
             pdf_text_chunks.append(" ".join(current_chunk))
 
     # PDF 텍스트 추출 및 처리
-    for page in reader.pages:
+    for page_number, page in enumerate(reader.pages, start=1):
         try:
             page_text = page.extract_text()
             if not page_text.strip():
                 raise ValueError("텍스트 추출 실패")
         except:
-            # OCR로 대체
-            images = convert_from_path(file_path)
-            for img in images:
-                page_text = pytesseract.image_to_string(img, lang='eng')
-                process_text(page_text, chunk_size)
-                return pdf_text_chunks
+            print(f"Page {page_number}: 텍스트 추출 실패, OCR로 전환 중...")
+            try:
+                image = convert_from_path(file_path, first_page=page_number, last_page=page_number)[0]
+                page_text = pytesseract.image_to_string(image, lang='eng')
+                if not page_text.strip():
+                    print(f"Page {page_number}: OCR 결과가 비어 있습니다. 건너뜁니다.")
+                    continue
+            except Exception as e:
+                print(f"Page {page_number}: OCR 실패: {e}")
+                continue
         
         # 청크 크기 조정
-        
         if adaptive_chunking:
-            avg_word_count = len(page_text.split()) // len(page_text.split("\n"))
-            adjusted_chunk_size = max(chunk_size, avg_word_count * 3)
+            doc = nlp(page_text)
+            avg_sentence_length = sum(len(sent.text.split()) for sent in doc.sents) / len(list(doc.sents))
+            adjusted_chunk_size = max(chunk_size, int(avg_sentence_length * 3))
         else:
             adjusted_chunk_size = chunk_size
 
@@ -101,6 +112,7 @@ def extract_text_from_pdf_with_spacy(file_path, chunk_size=200, adaptive_chunkin
         process_text(page_text, adjusted_chunk_size)
 
     return pdf_text_chunks
+
 
 # 이미지에서 텍스트 추출
 def extract_text_from_image(image_path):
@@ -126,52 +138,139 @@ def build_safe_prompt(query, context_chunks):
     return prompt
 
 # 임베딩 생성 및 Faiss 인덱스 생성
-def create_embeddings_and_index():
+
+def create_embeddings_and_index(index_type="FlatL2"):
     """
     PDF 청크 임베딩 생성 및 Faiss 인덱스 생성
+
+    Args:
+        index_type (str): 사용할 인덱스 타입 ("FlatL2", "IVFFlat", "HNSWFlat")
+
+    Returns:
+        None
     """
     global faiss_index
+    print(f"Creating embeddings for pdf_text_chunks: {pdf_text_chunks}")  # 디버깅용
+    if not pdf_text_chunks:
+        print("Error: pdf_text_chunks is empty. Cannot create embeddings.")
+        return
     embeddings = embedding_model.encode(pdf_text_chunks)
+    print(f"Generated embeddings: {embeddings}")  # 디버깅용
+    if embeddings.shape[0] == 0:
+        print("Error: Embeddings are empty. Cannot create FAISS index.")
+        return
     dimension = embeddings.shape[1]
-    faiss_index = faiss.IndexFlatL2(dimension)
+    
+    if index_type == "FlatL2":
+        # 완전탐색 방식
+        faiss_index = faiss.IndexFlatL2(dimension)
+
+    elif index_type == "IVFFlat":
+        # Inverted File Index 방식
+        nlist = 100  # 클러스터 수 (데이터 규모에 맞게 조정)
+        quantizer = faiss.IndexFlatL2(dimension)
+        faiss_index = faiss.IndexIVFFlat(quantizer, dimension, nlist, faiss.METRIC_L2)
+
+        # 학습 단계 필요
+        faiss_index.train(embeddings)
+
+    elif index_type == "HNSWFlat":
+        # Hierarchical Navigable Small World 방식
+        hnsw_param = 32  # 그래프 내 이웃 수
+        faiss_index = faiss.IndexHNSWFlat(dimension, hnsw_param)
+        faiss_index.hnsw.efConstruction = 40  # 그래프 빌드 시 성능 조정
+        faiss_index.hnsw.efSearch = 20  # 검색 시 성능 조정
+
+    else:
+        raise ValueError("지원하지 않는 index_type입니다. 'FlatL2', 'IVFFlat', 'HNSWFlat' 중 하나를 선택하세요.")
+
+    # 임베딩 추가
     faiss_index.add(embeddings)
 
 # top-k 검색 기능
 def search_top_k(query, k=5):
     """
     사용자 질문에 따라 top-k 검색 결과 반환
+
+    Args:
+        query (str): 검색 질의
+        k (int): 반환할 결과의 개수
+
+    Returns:
+        str: JSON 형식의 검색 결과
     """
     if faiss_index is None:
-        return "PDF가 아직 업로드되지 않았습니다. 먼저 PDF를 업로드해주세요."
+        return json.dumps({"error": "PDF가 아직 업로드되지 않았습니다. 먼저 PDF를 업로드해주세요."})
+
+    # k 값 방어 로직
+    if k <= 0:
+        return json.dumps({"error": "k 값은 양수여야 합니다."})
+    if k > len(pdf_text_chunks):
+        k = len(pdf_text_chunks)  # 최대 청크 개수로 제한
+
+    # 검색 수행
     query_embedding = embedding_model.encode([query])
     distances, indices = faiss_index.search(np.array(query_embedding), k)
-    results = [pdf_text_chunks[idx] for idx in indices[0]]
-    return results
+
+    # 검색 결과 생성
+    results = []
+    for dist, idx in zip(distances[0], indices[0]):
+        results.append({
+            "chunk": pdf_text_chunks[idx],
+            "score": float(dist)  # numpy 값 JSON 직렬화 처리
+        })
+
+    # 검색 로그 저장
+    search_logs.append({
+        "query": query,
+        "timestamp": datetime.now().isoformat(),
+        "results": results
+    })
+
+    # 결과 반환
+    return json.dumps({"query": query, "results": results}, ensure_ascii=False, indent=4)
+
 
 # MySQL 연결 풀 생성
 connection_pool = pooling.MySQLConnectionPool(
     pool_name="mypool",
     pool_size=POOL_SIZE,
     pool_reset_session=True,
-    host="localhost",
-    user="root",
-    password="030617",  # MySQL 비밀번호 입력
-    database="search_logs"
+    host=os.getenv("DB_HOST"),
+    user=os.getenv("DB_USER"),
+    password=os.getenv("DB_PASSWORD"),
+    database=os.getenv("DB_NAME")
 )
+
 
 def log_search_query(user_id, query, results):
     """
     검색 기록을 MySQL 데이터베이스에 저장 (연결 풀링 적용)
+
+    Args:
+        user_id (str): 사용자 ID
+        query (str): 검색 질의
+        results (list): 검색 결과 (JSON 직렬화 가능 객체)
     """
     try:
+        # results를 JSON 형식으로 변환
+        results_json = json.dumps(results, ensure_ascii=False, indent=4)
+
+        # 데이터베이스 연결
         connection = connection_pool.get_connection()
         cursor = connection.cursor()
+
+        # INSERT 쿼리 실행
         query_statement = "INSERT INTO logs (user_id, query, results) VALUES (%s, %s, %s)"
-        cursor.execute(query_statement, (user_id, query, str(results)))
+        cursor.execute(query_statement, (user_id, query, results_json))
+
+        # 변경 사항 커밋
         connection.commit()
+
     except mysql.connector.Error as err:
         print(f"Database error: {err}")
     finally:
+        # 리소스 정리
         if connection.is_connected():
             cursor.close()
             connection.close()
@@ -201,8 +300,12 @@ def handle_pdf_upload(pdf):
     """
     PDF 업로드 후 처리
     """
+    global pdf_text_chunks
     if pdf is not None:
-        extract_text_from_pdf_with_spacy(pdf.name)
+        pdf_text_chunks = extract_text_from_pdf_with_spacy(pdf.name)
+        print(f"Extracted pdf_text_chunks: {pdf_text_chunks}")  # 디버깅용
+        if not pdf_text_chunks:
+            return "PDF에서 텍스트를 추출하지 못했습니다. 올바른 파일인지 확인해주세요."
         create_embeddings_and_index()
         return "PDF가 성공적으로 업로드되었습니다. 질문을 입력해주세요."
     return "PDF 파일을 업로드하세요."
@@ -217,11 +320,15 @@ def handle_pdf_query_with_question(question):
     if not question:
         return "질문을 입력해주세요."
     
-    results = search_top_k(question, k=3)
-    context = "\n\n".join(results)
-    safe_prompt = build_safe_prompt(question, context)
-    # LLM에 프롬프트 전달 (여기서는 예시로 응답)
-    response = f"모델 응답:\n{safe_prompt}"
+    # JSON 데이터를 불러와 결과 가공
+    results = json.loads(search_top_k(question, k=3))  # JSON 문자열 -> Python 객체
+    formatted_results = "\n\n".join(
+        [f"청크: {item['chunk']}\n점수: {item['score']}" for item in results["results"]]
+    )
+    
+    # 안전한 프롬프트 생성
+    safe_prompt = build_safe_prompt(question, formatted_results)
+    response = f"질문: {question}\n\n검색 결과:\n{formatted_results}\n\n모델 응답:\n{safe_prompt}"
     
     # 로그 저장
     log_search_query(user_id="test_user", query=question, results=results)
