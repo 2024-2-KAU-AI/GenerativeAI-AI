@@ -11,6 +11,7 @@ import pytesseract
 import spacy
 import mysql.connector
 import os  # 환경 변수 사용을 위한 모듈
+import model
 
 # Tesseract 한국어 지원 설정 (MacOS Homebrew 경로)
 pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"  # Tesseract 실행 파일 경로
@@ -133,7 +134,8 @@ def log_search_query(user_id, query, result_indices):
 
 # Gradio 핸들러: 텍스트 질의
 def handle_text_query(text):
-    return f"질문에 대한 답변: {text}"
+
+    return text
 
 # Gradio 핸들러: 이미지 질의
 def handle_image_query(image, question):
@@ -165,7 +167,7 @@ def handle_pdf_query_with_question(question):
     context = "\n\n".join(results)
     safe_prompt = build_safe_prompt(question, context)
     # LLM에 프롬프트 전달 (여기서는 예시로 응답)
-    response = f"모델 응답:\n{safe_prompt}"
+    response = safe_prompt
     return response
 
 # CSS 스타일 정의
