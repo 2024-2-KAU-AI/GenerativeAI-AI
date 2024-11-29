@@ -34,14 +34,14 @@ embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 # 전역 변수
 faiss_index = None
 pdf_text_chunks = []  # PDF 청크 저장
-search_logs = []
+search_logos = []
 load_dotenv()
 chunk_size = 200  # 청크 크기 (단어 단위)
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_USER = os.getenv("DB_USER", "root")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "password")
-DB_NAME = os.getenv("DB_NAME", "search_logs")
+DB_NAME = os.getenv("DB_NAME", "search_logos")
 
 
 # 환경 변수에서 연결 풀 크기 설정 (기본값: 5)
@@ -221,7 +221,7 @@ def search_top_k(query, k=5):
         })
 
     # 검색 로그 저장
-    search_logs.append({
+    search_logos.append({
         "query": query,
         "timestamp": datetime.now().isoformat(),
         "results": results
