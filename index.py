@@ -170,8 +170,8 @@ def handle_pdf_query(pdf, question):
     create_embeddings_and_index()
     prompt = f"PDF에서 추출된 텍스트 기반 답변\n질문: {question}"
     model_response = generate_response(prompt)
-    did_id = generate_DiD_id(model_response)
-    did_url = generate_DiD_url(did_id)
+    did_id = "url"#generate_DiD_id(model_response)
+    did_url = "id"#generate_DiD_url(did_id)
     return f"모델 응답:\n{model_response}\n\nDiD 결과 URL: {did_url}"
 
 # 플랫폼 페이지 정의
