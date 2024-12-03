@@ -16,8 +16,13 @@ import huggingfaceLogin
 from dotenv import load_dotenv
 
 # Tesseract 실행 파일 경로 설정 (Windows용)
-pytesseract.pytesseract.tesseract_cmd = "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
-tessdata_dir_config = '--tessdata-dir "C:\\Program Files\\Tesseract-OCR\\tessdata" -l kor+eng'
+#pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# 언어 데이터 경로 및 언어 설정 (Windows용)
+#tessdata_dir_config = r'--tessdata-dir "C:\Program Files\Tesseract-OCR\tessdata" -l kor+eng'
+# Tesseract 한국어 지원 설정 (MacOS Homebrew 경로)
+pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"  # Tesseract 실행 파일 경로
+tessdata_dir_config = '--tessdata-dir "/opt/homebrew/share/tessdata" -l kor+eng'  # 언어 설정
 
 # Huggingface 로그인
 huggingfaceLogin.login()
@@ -33,8 +38,8 @@ model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
 
 # 환경 변수 로드
 load_dotenv()
-DID_API_URL = "https://api.d-id.com/talks"
-source_url = os.getenv("PROF_IMAGE_URL")
+# DID_API_URL = "https://api.d-id.com/talks"
+# source_url = os.getenv("PROF_IMAGE_URL")
 
 # 전역 변수
 faiss_index = None
@@ -92,51 +97,71 @@ def generate_response(prompt):
     except Exception as e:
         return f"오류 발생: {e}"
 
-# DiD API 호출
-def generate_DiD_id(answer):
-    payload = {
-        "source_url": source_url,
-        "script": {
-            "type": "text",
-            "subtitles": "false",
-            "provider": {"type": "google", "key": "ko-KR-Standard-D"},
-            "input": answer
-        },
-        "config": {"fluent": "false", "pad_audio": "0.0"}
-    }
-    headers = {
-        "Authorization": "Basic " + os.getenv("DID_KEY"),
-        "accept": "application/json",
-        "Content-Type": "application/json"
-    }
-    responses = requests.post(DID_API_URL, json=payload, headers=headers)
-    response = responses.json()
-    return response["id"]
+# # DiD API 호출
+# def generate_DiD_id(answer):
+#     payload = {
+#         "source_url": source_url,
+#         "script": {
+#             "type": "text",
+#             "subtitles": "false",
+#             "provider": {"type": "google", "key": "ko-KR-Standard-D"},
+#             "input": answer
+#         },
+#         "config": {"fluent": "false", "pad_audio": "0.0"}
+#     }
+#     headers = {
+#         "Authorization": "Basic " + os.getenv("DID_KEY"),
+#         "accept": "application/json",
+#         "Content-Type": "application/json"
+#     }
+#     responses = requests.post(DID_API_URL, json=payload, headers=headers)
+#     response = responses.json()
+#     return response["id"]
 
-def generate_DiD_url(did_id):
-    url = f"https://d-id.com/talks/{did_id}"
-    headers = {
-        "Authorization": "Basic " + os.getenv("DID_KEY"),
-        "accept": "application/json"
-    }
-    response = requests.get(url, headers=headers)
-    return response.json()["result_url"]
+# def generate_DiD_id(answer):
+#     try:
+#         payload = {
+#             "source_url": source_url,
+#             "script": {
+#                 "type": "text",
+#                 "subtitles": "false",
+#                 "provider": {"type": "google", "key": "ko-KR-Standard-D"},
+#                 "input": answer
+#             },
+#             "config": {"fluent": "false", "pad_audio": "0.0"}
+#         }
+#         headers = {
+#             "Authorization": "Basic " + os.getenv("DID_KEY"),
+#             "accept": "application/json",
+#             "Content-Type": "application/json"
+#         }
+#         responses = requests.post(DID_API_URL, json=payload, headers=headers)
+#         response = responses.json()
+
+#         if responses.status_code != 200 or "id" not in response:
+#             raise Exception(f"Unexpected API response: {response}")
+
+#         return response["id"]
+
+#     except Exception as e:
+#         return f"DiD API 호출 중 오류가 발생했습니다: {e}"
+
 
 # Gradio 핸들러 함수
 def handle_text_query(text):
     model_response = generate_response(text)
-    did_id = generate_DiD_id(model_response)
-    did_url = generate_DiD_url(did_id)
-    return f"모델 응답:\n{model_response}\n\nDiD 결과 URL: {did_url}"
+    # did_id = generate_DiD_id(model_response)
+    # did_url = generate_DiD_url(did_id)
+    return f"모델 응답:\n{model_response}\n\n"
 
 def handle_image_query(image_path, question):
     # 이미지 분석 및 질문 처리
     extracted_text = pytesseract.image_to_string(Image.open(image_path), config=tessdata_dir_config)
     prompt = f"이미지에서 추출된 텍스트: {extracted_text}\n\n질문: {question}"
     model_response = generate_response(prompt)
-    did_id = generate_DiD_id(model_response)
-    did_url = generate_DiD_url(did_id)
-    return f"추출된 텍스트:\n{extracted_text}\n\n모델 응답:\n{model_response}\n\nDiD 결과 URL: {did_url}"
+    # did_id = generate_DiD_id(model_response)
+    # did_url = generate_DiD_url(did_id)
+    return f"추출된 텍스트:\n{extracted_text}\n\n모델 응답:\n{model_response}\n\n"
 
 def handle_pdf_query(pdf, question):
     # PDF 질문 처리
@@ -173,8 +198,6 @@ def tutor_platform(back_to_main):
             pdf_output = gr.Textbox(label="답변")
             pdf_button.click(handle_pdf_query, inputs=[pdf_input, pdf_question], outputs=pdf_output)
 
-        gr.HTML("<h3>DID API 기반 영상 응답</h3>")
-        gr.HTML("<p>AI가 생성한 답변을 교수님 캐릭터가 영상으로 설명합니다.</p>")
 
         # 뒤로가기 버튼 추가
         back_button = gr.Button("메인화면으로 가기")
