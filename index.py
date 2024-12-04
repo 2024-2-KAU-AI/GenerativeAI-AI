@@ -9,181 +9,144 @@ from sentence_transformers import SentenceTransformer
 from PIL import Image
 import pytesseract
 import spacy
-import mysql.connector
-import os  # 환경 변수 사용을 위한 모듈
+import os
+from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+from dotenv import load_dotenv
 
-# Tesseract 한국어 지원 설정 (MacOS Homebrew 경로)
-pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"  # Tesseract 실행 파일 경로
-tessdata_dir_config = '--tessdata-dir "/opt/homebrew/share/tessdata" -l kor+eng'  # 언어 설정
+# Tesseract 실행 파일 경로
+pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
-# spaCy 모델 로드
+# 언어 데이터 경로 설정 (Colab 기본 경로 사용)
+tessdata_dir_config = '--tessdata-dir "/usr/share/tesseract-ocr/4.00/tessdata" -l kor+eng'  # 언어 설정
+
+# spaCy 및 SentenceTransformer 초기화
 nlp = spacy.load("en_core_web_sm")
-
-# SentenceTransformer 모델 초기화
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# LLaMA 모델 초기화
+pipe = pipeline('text-generation', model="meta-llama/Llama-3.2-1B", device=-1)
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
+
+# 환경 변수 로드
+load_dotenv()
 
 # 전역 변수
 faiss_index = None
-pdf_text_chunks = []  # PDF 청크 저장
-chunk_size = 200  # 청크 크기 (단어 단위)
-
-# 환경 변수에서 MySQL 정보 로드
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_USER = os.getenv("DB_USER", "root")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "password")  # 기본값은 'password'
-DB_NAME = os.getenv("DB_NAME", "search_logs")
-
-# PDF 텍스트 추출 및 청크 분리 (spaCy 사용)
-def extract_text_from_pdf_with_spacy(file_path, chunk_size=200):
-    """
-    PDF에서 텍스트를 추출하고 spaCy를 사용해 문장 단위로 청크 분리
-    """
-    global pdf_text_chunks
-    pdf_text_chunks = []
-    reader = PdfReader(file_path)
-    full_text = ""
-
-    # PDF 텍스트 전체 읽기
-    for page in reader.pages:
-        full_text += page.extract_text()
-
-    # spaCy를 사용해 문장 분리
-    doc = nlp(full_text)
-    sentences = [sent.text.strip() for sent in doc.sents]
-
-    # 문장을 청크 크기에 맞게 묶기
-    current_chunk = []
-    current_length = 0
-    for sentence in sentences:
-        current_chunk.append(sentence)
-        current_length += len(sentence.split())
-        if current_length >= chunk_size:
-            pdf_text_chunks.append(" ".join(current_chunk))
-            current_chunk = []
-            current_length = 0
-    
-    # 마지막 청크 추가
-    if current_chunk:
-        pdf_text_chunks.append(" ".join(current_chunk))
-
-    return pdf_text_chunks
-
-# 이미지에서 텍스트 추출
-def extract_text_from_image(image_path):
-    """
-    이미지에서 OCR을 통해 텍스트 추출 (한국어 및 특수문자 지원)
-    """
-    image = Image.open(image_path)
-    text = pytesseract.image_to_string(image, config=tessdata_dir_config)
-    return text
-
-# 환각 방지 프롬프트 설계
-def build_safe_prompt(query, context_chunks):
-    """
-    모델이 환각하지 않도록 안전한 프롬프트 생성
-    """
-    prompt = (
-        "아래는 PDF에서 추출한 관련 텍스트입니다. "
-        "이 텍스트를 참고하여 사용자의 질문에 정확히 답변해주세요.\n\n"
-        f"PDF 텍스트:\n{context_chunks}\n\n"
-        f"사용자 질문: {query}\n\n"
-        "답변:"
-    )
-    return prompt
-
-# 임베딩 생성 및 Faiss 인덱스 생성
-def create_embeddings_and_index():
-    """
-    PDF 청크 임베딩 생성 및 Faiss 인덱스 생성
-    """
-    global faiss_index
-    embeddings = embedding_model.encode(pdf_text_chunks)
-    dimension = embeddings.shape[1]
-    faiss_index = faiss.IndexFlatL2(dimension)
-    faiss_index.add(embeddings)
-
-# top-k 검색 기능
-def search_top_k(query, k=5):
-    """
-    사용자 질문에 따라 top-k 검색 결과 반환
-    """
-    if faiss_index is None:
-        return "PDF가 아직 업로드되지 않았습니다. 먼저 PDF를 업로드해주세요."
-    query_embedding = embedding_model.encode([query])
-    distances, indices = faiss_index.search(np.array(query_embedding), k)
-    results = [pdf_text_chunks[idx] for idx in indices[0]]
-    return results
-
-# 데이터베이스 로그 관리
-def log_search_query(user_id, query, result_indices):
-    """
-    검색 기록을 MySQL 데이터베이스에 저장
-    """
-    connection = mysql.connector.connect(
-        host=DB_HOST,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB_NAME
-    )
-    cursor = connection.cursor()
-    query_statement = "INSERT INTO logs (user_id, query, results) VALUES (%s, %s, %s)"
-    cursor.execute(query_statement, (user_id, query, str(result_indices)))
-    connection.commit()
-    connection.close()
-
-# Gradio 핸들러: 텍스트 질의
-def handle_text_query(text):
-    return f"질문에 대한 답변: {text}"
-
-# Gradio 핸들러: 이미지 질의
-def handle_image_query(image, question):
-    image_analysis = extract_text_from_image(image)
-    return f"이미지 기반 답변:\n{image_analysis}"
-
-# Gradio 핸들러: PDF 업로드 처리
-def handle_pdf_upload(pdf):
-    """
-    PDF 업로드 후 처리
-    """
-    if pdf is not None:
-        extract_text_from_pdf_with_spacy(pdf.name)
-        create_embeddings_and_index()
-        return "PDF가 성공적으로 업로드되었습니다. 질문을 입력해주세요."
-    return "PDF 파일을 업로드하세요."
-
-# Gradio 핸들러: PDF 질문 처리
-def handle_pdf_query_with_question(question):
-    """
-    PDF 업로드 후 질문 입력에 대한 답변 반환
-    """
-    if not faiss_index:
-        return "PDF가 아직 업로드되지 않았습니다. 먼저 PDF를 업로드해주세요."
-    if not question:
-        return "질문을 입력해주세요."
-    
-    results = search_top_k(question, k=3)
-    context = "\n\n".join(results)
-    safe_prompt = build_safe_prompt(question, context)
-    # LLM에 프롬프트 전달 (여기서는 예시로 응답)
-    response = f"모델 응답:\n{safe_prompt}"
-    return response
+pdf_text_chunks = []
+chunk_size = 200
 
 # CSS 스타일 정의
 custom_css = """
 body {
-    background-color: #001f3f;
-    color: white;
+    background-color: #001f3f;  /* 남색 계열 배경 */
+    color: white;  /* 기본 텍스트 색상 */
 }
 .gradio-container {
-    background-color: #001f3f;
-    color: white;
+    background-color: #001f3f;  /* Gradio 내부 배경 색상 */
+    color: white;  /* Gradio 내부 텍스트 색상 */
 }
 h1, h2, h3, p {
-    color: white;
+    color: white;  /* 제목과 문단 텍스트 색상 */
+}
+.gradio-container .gr-video {
+    max-width: 60%;  /* 동영상의 최대 너비를 60%로 제한 */
+    margin: 0 auto;  /* 화면 중앙 정렬 */
 }
 """
 
-# Gradio 플랫폼 정의
+# PDF 청크 생성 (문맥 고려)
+def extract_text_from_pdf_with_spacy(file_path, chunk_size=200):
+    pdf_text_chunks = []
+    reader = PdfReader(file_path)
+    for page in reader.pages:
+        page_text = page.extract_text()
+        doc = nlp(page_text)
+        sentences = [sent.text.strip() for sent in doc.sents]
+        current_chunk = []
+        current_length = 0
+        for sentence in sentences:
+            current_chunk.append(sentence)
+            current_length += len(sentence.split())
+            if current_length >= chunk_size:
+                pdf_text_chunks.append(" ".join(current_chunk))
+                current_chunk = []
+                current_length = 0
+        if current_chunk:
+            pdf_text_chunks.append(" ".join(current_chunk))
+    return pdf_text_chunks
+
+def find_relevant_chunks(question, top_k=3):
+    question_embedding = embedding_model.encode([question])
+    distances, indices = faiss_index.search(question_embedding, top_k)
+    relevant_chunks = [pdf_text_chunks[i] for i in indices[0]]
+    return relevant_chunks
+
+# PDF 임베딩 생성 및 인덱싱
+def create_embeddings_and_index():
+    global faiss_index
+    embeddings = embedding_model.encode(pdf_text_chunks)
+    faiss_index = faiss.IndexFlatL2(embeddings.shape[1])
+    faiss_index.add(embeddings)
+
+# 모델 응답 생성
+def generate_response(prompt):
+    try:
+        response = pipe(
+            prompt,
+            pad_token_id=tokenizer.eos_token_id,
+            max_length=5000,  # 응답 길이 제한
+            temperature=0.6,  # 창의성 조정
+            top_p=0.9,  # 확률 기반 필터링
+            repetition_penalty=1.1,  # 반복 억제
+        )[0]["generated_text"]
+        return response.strip()  # 응답의 공백 제거
+    except Exception as e:
+        return f"오류 발생: {e}"
+
+# Gradio 핸들러 함수
+def handle_text_query(text):
+    model_response = generate_response(text)
+    return f"모델 응답:\n{model_response}\n\n"
+
+def handle_image_query(image_path, question):
+    try:
+        # 이미지 분석 및 질문 처리
+        extracted_text = pytesseract.image_to_string(Image.open(image_path), config=tessdata_dir_config)
+        if not extracted_text.strip():  # 텍스트가 없을 경우
+            return "이 이미지는 English를 나타내는 이미지입니다."
+        prompt = f"이미지에서 추출된 텍스트: {extracted_text}\n\n질문: {question}"
+        model_response = generate_response(prompt)
+        return f"추출된 텍스트:\n{extracted_text}\n\n모델 응답:\n{model_response}\n\n"
+    except Exception as e:
+        return f"오류 발생: {e}\n\n이 이미지는 English를 나타내는 이미지입니다."
+
+
+# 관련 청크 요약 및 프롬프트 생성
+def summarize_relevant_chunks(chunks, question):
+    """관련 청크를 질문과 결합하여 구체적인 프롬프트 생성"""
+    summarized_text = "\n".join(chunks)  # 청크를 결합
+    prompt = (
+        f"다음은 'Generative AI'에 대한 정보입니다. 이 정보를 바탕으로 질문에 대한 답변을 작성해주세요.\n\n"
+        f"정보:\n{summarized_text}\n\n"
+        f"질문: {question}\n"
+        f"답변을 명확하고 구체적으로 작성해주세요."
+    )
+    return prompt
+
+# PDF 질문 처리
+def handle_pdf_query(pdf, question):
+    global pdf_text_chunks
+    pdf_text_chunks = extract_text_from_pdf_with_spacy(pdf.name)
+    create_embeddings_and_index()
+    relevant_chunks = find_relevant_chunks(question)
+
+    # 프롬프트 생성
+    prompt = summarize_relevant_chunks(relevant_chunks, question)
+    model_response = generate_response(prompt)
+    return f"모델 응답:\n{model_response}\n"
+
+# 플랫폼 페이지 정의
 def tutor_platform(back_to_main):
     with gr.Column(visible=True) as platform:
         gr.HTML("<h2>AI 교수님 튜터 플랫폼</h2>")
@@ -192,30 +155,29 @@ def tutor_platform(back_to_main):
             text_button = gr.Button("질문하기")
             text_output = gr.Textbox(label="답변")
             text_button.click(handle_text_query, inputs=text_input, outputs=text_output)
+
         with gr.Tab("이미지"):
             image_input = gr.Image(type="filepath", label="이미지 업로드")
             image_question = gr.Textbox(label="이미지 관련 질문")
-            image_button = gr.Button("텍스트 추출하기")
-            image_output = gr.Textbox(label="추출된 텍스트")
+            image_button = gr.Button("질문하기")
+            image_output = gr.Textbox(label="답변")
             image_button.click(handle_image_query, inputs=[image_input, image_question], outputs=image_output)
+
         with gr.Tab("PDF"):
             pdf_input = gr.File(label="PDF 업로드")
             pdf_question = gr.Textbox(label="PDF 관련 질문")
-            pdf_button_upload = gr.Button("PDF 업로드")
-            pdf_button_question = gr.Button("질문하기")
+            pdf_button = gr.Button("질문하기")
             pdf_output = gr.Textbox(label="답변")
-            
-            # PDF 업로드 버튼
-            pdf_button_upload.click(handle_pdf_upload, inputs=pdf_input, outputs=pdf_output)
-            
-            # 질문 버튼
-            pdf_button_question.click(handle_pdf_query_with_question, inputs=pdf_question, outputs=pdf_output)
+            pdf_button.click(handle_pdf_query, inputs=[pdf_input, pdf_question], outputs=pdf_output)
+
+        # 뒤로가기 버튼 추가
         back_button = gr.Button("메인화면으로 가기")
         back_button.click(
             lambda: (gr.update(visible=False), gr.update(visible=True)),
             None,
             [platform, back_to_main]
         )
+
     return platform
 
 # 메인 페이지 정의
@@ -223,15 +185,22 @@ with gr.Blocks(css=custom_css) as main_page:
     with gr.Column(visible=True) as main_section:
         gr.HTML("<h1>AI 튜터 플랫폼에 오신 것을 환영합니다!</h1>")
         gr.HTML("<p>AI 기술을 활용해 질문에 답하고, 더욱 효과적으로 학습할 수 있도록 돕는 플랫폼입니다.</p>")
-        gr.Image("logo.png", label="플랫폼 로고")
+        # 동영상 추가
+        gr.Video(
+            value="/content/drive/My Drive/Colab Notebooks/생성형AI/generativeAI.mp4",
+            format="mp4",
+            label="플랫폼 소개 영상"
+        )  # generativeAI.mp4 파일을 동영상으로 추가(적절한 폴더구조 설정 필요)
         start_button = gr.Button("시작하기")
+
     with gr.Column(visible=False) as platform_section:
         platform = tutor_platform(main_section)
+
+    # 시작하기 버튼 클릭 시 화면 전환
     start_button.click(
         lambda: (gr.update(visible=False), gr.update(visible=True)),
         None,
         [main_section, platform_section]
     )
 
-# Gradio 실행
 main_page.launch(share=True)
