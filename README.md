@@ -81,6 +81,9 @@ Colab에서 새 노트를 생성하고 아래 코드를 실행합니다.
 # Jupyter Notebook 관련 (필요 시)
 !pip install nbformat nbconvert
 
+# pytesseract 설치
+!pip install pytesseract
+
 ```
 
 ### 2. 환경 변수 설정
