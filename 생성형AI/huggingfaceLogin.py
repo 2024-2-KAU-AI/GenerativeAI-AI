@@ -13,6 +13,7 @@ import os
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
 from dotenv import load_dotenv
 import sys
+from google.colab import drive
 
 if not os.path.isdir('/content/drive'):
   drive.mount('/content/drive')
